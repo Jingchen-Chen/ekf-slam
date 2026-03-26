@@ -8,4 +8,3 @@ venv/
 dist/
 build/
 .DS_Store
-*.gif
