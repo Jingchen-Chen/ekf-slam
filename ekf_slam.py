@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 EKF-SLAM for a 2-D differential-drive robot with point landmarks.
 
@@ -17,6 +19,8 @@ State vector:  mu = [x, y, theta,  lx_0, ly_0,  lx_1, ly_1, ...]
 import numpy as np
 from scipy.stats import chi2
 
+from utils import wrap_angle
+
 
 class EKFSLAM:
     """Full-state EKF-SLAM with dynamic landmark management."""
@@ -24,7 +28,8 @@ class EKFSLAM:
     def __init__(self, Q_obs: np.ndarray, R_motion: np.ndarray,
                  known_association: bool = False,
                  gate_threshold: float | None = None,
-                 min_obs_for_new_lm: int = 2):
+                 min_obs_for_new_lm: int = 2,
+                 max_candidate_age: int = 10):
         """
         Parameters
         ----------
@@ -36,6 +41,9 @@ class EKFSLAM:
         min_obs_for_new_lm: minimum confirmations required before a tentative
                             landmark is committed to the state vector (unknown
                             association only). Helps prevent ghost landmarks.
+        max_candidate_age : number of update calls after which a candidate that
+                            has not been re-observed is discarded (unknown
+                            association only). Prevents unbounded ghost build-up.
         """
         self.mu = np.zeros(3)
         self.Sigma = np.zeros((3, 3))
@@ -53,11 +61,13 @@ class EKFSLAM:
         self.known_association = known_association
         self.gate_threshold = gate_threshold or chi2.ppf(0.99, df=2)
         self.min_obs_for_new_lm = min_obs_for_new_lm
+        self.max_candidate_age = max_candidate_age
 
-        # Candidate buffer for unknown association: range/bearing sum for averaging
-        # key = candidate_id, value = dict with 'obs', 'count', 'r_sum', 'b_sin', 'b_cos'
+        # Candidate buffer for unknown association.
+        # key = candidate_id, value = dict with position, count, age, sigmas
         self._candidates: dict[int, dict] = {}
         self._next_candidate_id = 0
+        self._update_count: int = 0  # incremented each update() call for age tracking
 
         # Observation count per landmark
         self.observation_count: list[int] = []
@@ -78,23 +88,33 @@ class EKFSLAM:
         """
         v, w = u
         th = self.mu[2]
-        n = len(self.mu)
 
         # Motion model (mean update — noise-free)
         self.mu[0] += v * np.cos(th) * dt
         self.mu[1] += v * np.sin(th) * dt
-        self.mu[2] = self._wrap(self.mu[2] + w * dt)
+        self.mu[2] = wrap_angle(self.mu[2] + w * dt)
 
-        # Jacobian F (n×n) — identity except robot pose block
-        F = np.eye(n)
-        F[0, 2] = -v * np.sin(th) * dt
-        F[1, 2] = v * np.cos(th) * dt
+        # Sparse covariance propagation — F differs from I only in two entries:
+        #   F[0,2] = a = -v*sin(th)*dt,  F[1,2] = b = v*cos(th)*dt
+        # F @ Sigma @ F.T is computed without materialising the full n×n F matrix.
+        # Only row/col 2 of Sigma participates, making this O(n) vs O(n^2).
+        a = -v * np.sin(th) * dt
+        b = v * np.cos(th) * dt
+        col2 = self.Sigma[:, 2].copy()   # = row 2 (Sigma is symmetric)
+        s22 = float(self.Sigma[2, 2])
 
-        # Noise injection: only the robot pose rows receive process noise
-        G = np.zeros((n, 3))
-        G[:3, :3] = np.eye(3)
-
-        self.Sigma = F @ self.Sigma @ F.T + G @ self.R @ G.T
+        new_Sigma = self.Sigma.copy()
+        new_Sigma[0, :] += a * col2      # F row-0 off-diagonal contribution
+        new_Sigma[1, :] += b * col2      # F row-1 off-diagonal contribution
+        new_Sigma[:, 0] += a * col2      # F^T col-0 (symmetric)
+        new_Sigma[:, 1] += b * col2      # F^T col-1 (symmetric)
+        # Corner corrections: (0,0), (0,1), (1,0), (1,1) were updated twice
+        new_Sigma[0, 0] += a * a * s22
+        new_Sigma[0, 1] += a * b * s22
+        new_Sigma[1, 0] += b * a * s22
+        new_Sigma[1, 1] += b * b * s22
+        self.Sigma = new_Sigma
+        self.Sigma[:3, :3] += self.R
 
         # Track the largest robot pose uncertainty seen (for loop closure scoring)
         robot_trace = float(np.trace(self.Sigma[:3, :3]))
@@ -111,6 +131,9 @@ class EKFSLAM:
             Known association mode:   (range, bearing, landmark_id)
             Unknown association mode: (range, bearing)
         """
+        self._update_count += 1
+        self._prune_stale_candidates()
+
         for obs in observations:
             if self.known_association:
                 r_obs, b_obs, gt_id = obs
@@ -154,7 +177,7 @@ class EKFSLAM:
             z_hat, H, S = self._compute_observation_model(idx)
 
             innovation = np.array([r_obs - z_hat[0],
-                                   self._wrap(b_obs - z_hat[1])])
+                                   wrap_angle(b_obs - z_hat[1])])
             try:
                 S_inv = np.linalg.inv(S)
             except np.linalg.LinAlgError:
@@ -182,12 +205,12 @@ class EKFSLAM:
             dy = cand_pos[1] - self.mu[1]
             q = max(dx**2 + dy**2, 1e-6)
             sq = np.sqrt(q)
-            z_hat_c = np.array([sq, self._wrap(np.arctan2(dy, dx) - self.mu[2])])
+            z_hat_c = np.array([sq, wrap_angle(np.arctan2(dy, dx) - self.mu[2])])
 
             # Use a loose covariance based on position uncertainty of candidate
             S_c = np.diag([cand['sigma_r']**2 + self.Q[0, 0],
                            cand['sigma_b']**2 + self.Q[1, 1]])
-            inno = np.array([r_obs - z_hat_c[0], self._wrap(b_obs - z_hat_c[1])])
+            inno = np.array([r_obs - z_hat_c[0], wrap_angle(b_obs - z_hat_c[1])])
             try:
                 d2_c = float(inno @ np.linalg.inv(S_c) @ inno)
             except np.linalg.LinAlgError:
@@ -200,6 +223,7 @@ class EKFSLAM:
             # Update existing candidate with new observation (running mean of position)
             cand = self._candidates[best_cid]
             cand['count'] += 1
+            cand['last_seen'] = self._update_count
             # Update running mean of candidate position
             th = self.mu[2]
             x_obs = self.mu[0] + r_obs * np.cos(b_obs + th)
@@ -237,9 +261,18 @@ class EKFSLAM:
                 'count': 1,
                 'sigma_r': sigma_pos,
                 'sigma_b': sigma_b * 3,
+                'last_seen': self._update_count,
             }
             self._next_candidate_id += 1
             return None
+
+    def _prune_stale_candidates(self):
+        """Remove candidates that have not been re-observed within max_candidate_age steps."""
+        cutoff = self._update_count - self.max_candidate_age
+        stale = [cid for cid, c in self._candidates.items()
+                 if c['last_seen'] < cutoff]
+        for cid in stale:
+            del self._candidates[cid]
 
     def _get_or_create_landmark(self, gt_id: int,
                                 r_obs: float, b_obs: float) -> int:
@@ -314,7 +347,7 @@ class EKFSLAM:
         q = max(dx**2 + dy**2, 1e-6)
         sq = np.sqrt(q)
 
-        z_hat = np.array([sq, self._wrap(np.arctan2(dy, dx) - self.mu[2])])
+        z_hat = np.array([sq, wrap_angle(np.arctan2(dy, dx) - self.mu[2])])
 
         n = len(self.mu)
         H = np.zeros((2, n))
@@ -332,24 +365,25 @@ class EKFSLAM:
         n = len(self.mu)
 
         try:
-            S_inv = np.linalg.inv(S)
+            K = np.linalg.solve(S.T, (self.Sigma @ H.T).T).T
         except np.linalg.LinAlgError:
             return
 
-        K = self.Sigma @ H.T @ S_inv
-
         innovation = np.array([r_obs - z_hat[0],
-                               self._wrap(b_obs - z_hat[1])])
+                               wrap_angle(b_obs - z_hat[1])])
 
         # Snapshot robot pose trace BEFORE update (for loop closure scoring)
         trace_before = float(np.trace(self.Sigma[:3, :3]))
 
         self.mu += K @ innovation
-        self.mu[2] = self._wrap(self.mu[2])
+        self.mu[2] = wrap_angle(self.mu[2])
 
         # Joseph form: (I-KH)Σ(I-KH)ᵀ + KQKᵀ  — numerically stable
         IKH = np.eye(n) - K @ H
         self.Sigma = IKH @ self.Sigma @ IKH.T + K @ self.Q @ K.T
+
+        # Enforce symmetry (floating-point drift accumulates over many steps)
+        self.Sigma = (self.Sigma + self.Sigma.T) * 0.5
 
         # Loop closure detection:
         # A "real" loop closure is a significant reduction in the ROBOT pose
@@ -404,7 +438,4 @@ class EKFSLAM:
                 for j in range(self.n_landmarks)
                 if self.initialized[j]}
 
-    @staticmethod
-    def _wrap(a: float) -> float:
-        """Wrap angle to (-pi, pi]."""
-        return (a + np.pi) % (2 * np.pi) - np.pi
+

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Visualizer for EKF-SLAM and FastSLAM.
 

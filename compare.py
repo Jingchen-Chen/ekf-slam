@@ -22,6 +22,7 @@ from ekf_slam import EKFSLAM
 from fastslam import FastSLAM
 from simulation import Simulation
 from evaluation import SLAMEvaluator
+from utils import wrap_angle
 from visualization import plot_trajectory_comparison
 
 
@@ -72,7 +73,7 @@ def _pre_generate_noise(sim: Simulation, steps: int,
         x, y, th = state
         x += (v + m_noise[0]) * np.cos(th) * dt
         y += (v + m_noise[1]) * np.sin(th) * dt
-        th += (w + m_noise[2]) * dt
+        th = wrap_angle(th + (w + m_noise[2]) * dt)
         state = np.array([x, y, th])
 
         # Generate observation noise for all landmarks
@@ -81,7 +82,7 @@ def _pre_generate_noise(sim: Simulation, steps: int,
             dx, dy = lx - state[0], ly - state[1]
             r = np.hypot(dx, dy)
             if r < sim.max_range:
-                bearing = np.arctan2(dy, dx) - state[2]
+                bearing = wrap_angle(np.arctan2(dy, dx) - state[2])
                 r_noise = np.random.normal(0, np.sqrt(sim.Q_obs[0, 0]))
                 b_noise = np.random.normal(0, np.sqrt(sim.Q_obs[1, 1]))
                 obs_for_step.append((i, r, bearing, r_noise, b_noise))
@@ -97,7 +98,7 @@ def _replay_step(state: np.ndarray, u: tuple[float, float],
     x, y, th = state
     x += (v + m_noise[0]) * np.cos(th) * dt
     y += (v + m_noise[1]) * np.sin(th) * dt
-    th += (w + m_noise[2]) * dt
+    th = wrap_angle(th + (w + m_noise[2]) * dt)
     return np.array([x, y, th])
 
 

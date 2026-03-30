@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Quantitative evaluation utilities for SLAM algorithms.
 
@@ -12,6 +14,8 @@ The landmark matching handles both:
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from utils import wrap_angle
+
 
 class SLAMEvaluator:
     """Collects trajectory data and computes evaluation metrics."""
@@ -20,11 +24,15 @@ class SLAMEvaluator:
         self.landmarks_true = landmarks_true.copy()
         self.true_poses: list[np.ndarray] = []
         self.est_poses: list[np.ndarray] = []
+        self.true_headings: list[float] = []
+        self.est_headings: list[float] = []
 
     def record(self, true_pose: np.ndarray, est_pose: np.ndarray):
-        """Record one timestep of true and estimated robot pose."""
+        """Record one timestep of true and estimated robot pose (x, y, theta)."""
         self.true_poses.append(true_pose[:2].copy())
         self.est_poses.append(est_pose[:2].copy())
+        self.true_headings.append(float(true_pose[2]) if len(true_pose) > 2 else 0.0)
+        self.est_headings.append(float(est_pose[2]) if len(est_pose) > 2 else 0.0)
 
     # ── Trajectory metrics ───────────────────────────────────────────────────
 
@@ -39,6 +47,12 @@ class SLAMEvaluator:
         true = np.array(self.true_poses)
         est = np.array(self.est_poses)
         return np.sqrt(np.sum((true - est) ** 2, axis=1))
+
+    def heading_rmse(self) -> float:
+        """Root mean square error of heading (theta) with proper angle wrapping."""
+        errs = np.array([wrap_angle(e - t)
+                         for t, e in zip(self.true_headings, self.est_headings)])
+        return float(np.sqrt(np.mean(errs ** 2)))
 
     # ── Landmark metrics ─────────────────────────────────────────────────────
 
@@ -137,6 +151,7 @@ class SLAMEvaluator:
                 landmark_indices: dict[int, int] | None = None) -> str:
         """Return a formatted evaluation summary string."""
         traj_rmse = self.trajectory_rmse()
+        head_rmse = self.heading_rmse()
         lm = self.landmark_errors(mu, initialized, landmark_indices)
 
         lines = [
@@ -144,6 +159,7 @@ class SLAMEvaluator:
             '  SLAM Evaluation Results',
             '=' * 55,
             f"  Trajectory RMSE:         {traj_rmse:.4f} m",
+            f"  Heading RMSE:            {np.degrees(head_rmse):.4f} deg",
             f"  Landmark mean error:     {lm['mean_error']:.4f} m",
             f"  Landmark RMSE:           {lm['rmse']:.4f} m",
             '-' * 55,

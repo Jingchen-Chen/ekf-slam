@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 FastSLAM 1.0 for a 2-D robot with point landmarks.
 
@@ -18,6 +20,8 @@ Reference: Montemerlo, Thrun, Koller, Wegbreit (2002).
 
 import numpy as np
 from scipy.stats import chi2
+
+from utils import wrap_angle
 
 
 class _LandmarkEKF:
@@ -71,7 +75,8 @@ class FastSLAM:
                  R_motion: np.ndarray,
                  known_association: bool = False,
                  gate_threshold: float | None = None,
-                 min_obs_for_new_lm: int = 2):
+                 min_obs_for_new_lm: int = 2,
+                 max_candidate_age: int = 10):
         """
         Parameters
         ----------
@@ -81,6 +86,7 @@ class FastSLAM:
         known_association  : if True, observations carry ground-truth landmark IDs
         gate_threshold     : Mahalanobis distance^2 gate (default chi2(2).ppf(0.99))
         min_obs_for_new_lm : candidate confirmations before adding to map
+        max_candidate_age  : update calls before an un-matched candidate is discarded
         """
         self.M = n_particles
         self.Q = Q_obs.copy()
@@ -88,6 +94,8 @@ class FastSLAM:
         self.known_association = known_association
         self.gate_threshold = gate_threshold or chi2.ppf(0.99, df=2)
         self.min_obs = min_obs_for_new_lm
+        self.max_candidate_age = max_candidate_age
+        self._update_count: int = 0
 
         self.particles = [Particle() for _ in range(self.M)]
 
@@ -110,12 +118,16 @@ class FastSLAM:
             th = p.pose[2]
             p.pose[0] += (v + noise[0]) * np.cos(th) * dt
             p.pose[1] += (v + noise[1]) * np.sin(th) * dt
-            p.pose[2] = _wrap(p.pose[2] + (w + noise[2]) * dt)
+            p.pose[2] = wrap_angle(p.pose[2] + (w + noise[2]) * dt)
 
     # ── UPDATE ────────────────────────────────────────────────────────────────
 
     def update(self, observations: list):
         """Update log-weights and per-landmark EKFs for each particle."""
+        self._update_count += 1
+        for p in self.particles:
+            self._prune_stale_candidates(p)
+
         for obs in observations:
             if self.known_association:
                 r_obs, b_obs, gt_id = obs
@@ -137,8 +149,8 @@ class FastSLAM:
                     # Proper covariance init via inverse Jacobian
                     H = _obs_jacobian_landmark(p.pose, lm.mu)
                     try:
-                        H_inv = np.linalg.inv(H)
-                        lm.Sigma = H_inv @ self.Q @ H_inv.T
+                        H_inv_Q = np.linalg.solve(H, self.Q)
+                        lm.Sigma = np.linalg.solve(H, H_inv_Q.T).T
                     except np.linalg.LinAlgError:
                         lm.Sigma = np.eye(2) * 1.0
                     lm.observed = True
@@ -150,18 +162,19 @@ class FastSLAM:
                     S = H_lm @ lm.Sigma @ H_lm.T + self.Q
                     innovation = np.array([
                         r_obs - z_hat[0],
-                        _wrap(b_obs - z_hat[1])
+                        wrap_angle(b_obs - z_hat[1])
                     ])
 
                     try:
-                        S_inv = np.linalg.inv(S)
+                        K = np.linalg.solve(S.T, (lm.Sigma @ H_lm.T).T).T
+                        maha2 = float(innovation @ np.linalg.solve(S, innovation))
                     except np.linalg.LinAlgError:
                         continue
-
-                    K = lm.Sigma @ H_lm.T @ S_inv
                     lm.mu = lm.mu + K @ innovation
                     IKH = np.eye(2) - K @ H_lm
                     lm.Sigma = IKH @ lm.Sigma @ IKH.T + K @ self.Q @ K.T
+                    # Enforce symmetry to prevent floating-point drift
+                    lm.Sigma = (lm.Sigma + lm.Sigma.T) * 0.5
                     lm.obs_count += 1
 
                     # Log-likelihood: log N(innovation; 0, S)
@@ -169,7 +182,6 @@ class FastSLAM:
                     sign, log_det_S = np.linalg.slogdet(S)
                     if sign <= 0:
                         continue
-                    maha2 = float(innovation @ S_inv @ innovation)
                     log_lik = -0.5 * (2 * np.log(2 * np.pi) + log_det_S + maha2)
                     p.log_weight += log_lik
 
@@ -195,9 +207,9 @@ class FastSLAM:
                 continue
             z_hat, H = _predicted_obs(p.pose, lm.mu)
             S = H @ lm.Sigma @ H.T + self.Q
-            inno = np.array([r_obs - z_hat[0], _wrap(b_obs - z_hat[1])])
+            inno = np.array([r_obs - z_hat[0], wrap_angle(b_obs - z_hat[1])])
             try:
-                d2 = float(inno @ np.linalg.inv(S) @ inno)
+                d2 = float(inno @ np.linalg.solve(S, inno))
             except np.linalg.LinAlgError:
                 continue
             if d2 < best_dist:
@@ -213,12 +225,12 @@ class FastSLAM:
             dy = cand['y'] - p.pose[1]
             q = max(dx**2 + dy**2, 1e-6)
             sq = np.sqrt(q)
-            z_hat_c = np.array([sq, _wrap(np.arctan2(dy, dx) - p.pose[2])])
+            z_hat_c = np.array([sq, wrap_angle(np.arctan2(dy, dx) - p.pose[2])])
             S_c = np.diag([cand['sr']**2 + self.Q[0, 0],
                            cand['sb']**2 + self.Q[1, 1]])
-            inno_c = np.array([r_obs - z_hat_c[0], _wrap(b_obs - z_hat_c[1])])
+            inno_c = np.array([r_obs - z_hat_c[0], wrap_angle(b_obs - z_hat_c[1])])
             try:
-                d2_c = float(inno_c @ np.linalg.inv(S_c) @ inno_c)
+                d2_c = float(inno_c @ np.linalg.solve(S_c, inno_c))
             except np.linalg.LinAlgError:
                 continue
             if d2_c < best_cdist:
@@ -236,6 +248,7 @@ class FastSLAM:
             cand['x'] += (x_obs - cand['x']) / n
             cand['y'] += (y_obs - cand['y']) / n
             cand['count'] = n
+            cand['last_seen'] = self._update_count
             if n >= self.min_obs:
                 j = _add_lm(p)
                 p.landmarks[j].mu[:] = [cand['x'], cand['y']]
@@ -246,9 +259,20 @@ class FastSLAM:
             p._candidates[p._next_cid] = {
                 'x': x_obs, 'y': y_obs, 'count': 1,
                 'sr': sr, 'sb': sb * 3,
+                'last_seen': self._update_count,
             }
             p._next_cid += 1
             return None
+
+    # ── CANDIDATE MANAGEMENT ───────────────────────────────────────────────────
+
+    def _prune_stale_candidates(self, p: 'Particle'):
+        """Discard candidates in particle p that haven't been seen recently."""
+        cutoff = self._update_count - self.max_candidate_age
+        stale = [cid for cid, c in p._candidates.items()
+                 if c['last_seen'] < cutoff]
+        for cid in stale:
+            del p._candidates[cid]
 
     # ── RESAMPLING ─────────────────────────────────────────────────────────────
 
@@ -391,7 +415,7 @@ def _predicted_obs(pose: np.ndarray, lm_mu: np.ndarray):
     dy = lm_mu[1] - pose[1]
     q = max(dx**2 + dy**2, 1e-6)
     sq = np.sqrt(q)
-    z_hat = np.array([sq, _wrap(np.arctan2(dy, dx) - pose[2])])
+    z_hat = np.array([sq, wrap_angle(np.arctan2(dy, dx) - pose[2])])
     H = np.array([[dx / sq, dy / sq],
                   [-dy / q, dx / q]])
     return z_hat, H
@@ -401,8 +425,3 @@ def _obs_jacobian_landmark(pose: np.ndarray, lm_mu: np.ndarray) -> np.ndarray:
     """2x2 Jacobian of observation model w.r.t. landmark position."""
     _, H = _predicted_obs(pose, lm_mu)
     return H
-
-
-def _wrap(a: float) -> float:
-    """Wrap angle to (-pi, pi]."""
-    return (a + np.pi) % (2 * np.pi) - np.pi

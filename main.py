@@ -128,9 +128,11 @@ def main():
     lm_result = evaluator.landmark_errors(
         ekf.mu, ekf.initialized, lm_indices, known_association=known)
     traj_rmse = evaluator.trajectory_rmse()
+    head_rmse = evaluator.heading_rmse()
     lines = [
         '=' * 55, '  SLAM Evaluation Results', '=' * 55,
         f"  Trajectory RMSE:         {traj_rmse:.4f} m",
+        f"  Heading RMSE:            {np.degrees(head_rmse):.4f} deg",
         f"  Landmark mean error:     {lm_result['mean_error']:.4f} m",
         f"  Landmark RMSE:           {lm_result['rmse']:.4f} m",
         '-' * 55,

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Ground-truth motion and noisy sensor simulation for 2-D SLAM.
 
@@ -16,6 +18,8 @@ robot always has 2-5 landmarks in its 8 m sensor range.
 """
 
 import numpy as np
+
+from utils import wrap_angle
 
 
 class Simulation:
@@ -63,7 +67,7 @@ class Simulation:
 
         x += (v + noise[0]) * np.cos(th) * dt
         y += (v + noise[1]) * np.sin(th) * dt
-        th = _wrap(th + (w + noise[2]) * dt)
+        th = wrap_angle(th + (w + noise[2]) * dt)
         return np.array([x, y, th])
 
     # ── Observation model ────────────────────────────────────────────────────
@@ -80,7 +84,7 @@ class Simulation:
             dx, dy = lx - x, ly - y
             r = np.hypot(dx, dy)
             if r < self.max_range:
-                bearing = _wrap(np.arctan2(dy, dx) - th)
+                bearing = wrap_angle(np.arctan2(dy, dx) - th)
                 r_noisy = r + np.random.normal(0.0, np.sqrt(self.Q_obs[0, 0]))
                 b_noisy = bearing + np.random.normal(0.0, np.sqrt(self.Q_obs[1, 1]))
                 observations.append((r_noisy, b_noisy, i))
@@ -95,6 +99,3 @@ class Simulation:
         return [(r, b) for r, b, _ in self.observe(state_true)]
 
 
-def _wrap(a: float) -> float:
-    """Wrap angle to (-pi, pi]."""
-    return (a + np.pi) % (2 * np.pi) - np.pi
